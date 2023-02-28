@@ -1,0 +1,106 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: azure-devops-secrets
+
+stages:
+- stage: Build
+  displayName: Build and test
+  jobs:
+  - job: Build
+    displayName: Build and test
+    steps:
+    - task: MavenAuthenticate@0
+      inputs:
+        artifactsFeeds: 'maven-repo'
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean verify'
+        options: '-Dmaven.test.failure.ignore=true'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+    - task: PublishTestResults@2
+      inputs:
+        testRunner: 'JUnit'
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        failTaskOnFailedTests: true
+
+- stage: BuildVM
+  displayName: Build VM
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: BuildVM
+    displayName: Build VM
+    steps:
+    - task: AzureResourceGroupDeployment@3
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        resourceGroupName: '$(resourceGroupName)'
+        location: '$(location)'
+        csmFile: '$(System.DefaultWorkingDirectory)/VM/deploy.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/VM/deploy.parameters.json'
+        overrideParameters: '-vmName $(vmName)'
+
+- stage: BuildWebApp
+  displayName: Build Web App
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: BuildWebApp
+    displayName: Build Web App
+    steps:
+    - task: AzureWebApp@1
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        appName: '$(appName)'
+        package: '$(System.DefaultWorkingDirectory)/WebApp/target/*.war'
+        publishProfile: '$(publishProfile)'
+
+- stage: DeployDev
+  displayName: Deploy to Dev
+  dependsOn: [BuildVM, BuildWebApp]
+  condition: succeeded()
+  jobs:
+  - deployment: DeployDev
+    displayName: Deploy to Dev
+    environment: 'Dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials --resource-group $(resourceGroupName) --name $(aksName)
+                kubectl apply -f $(System.DefaultWorkingDirectory)/AKS/deploy-dev.yaml
+    # Add approval gate
+    - deployment: ApprovalGate
+      dependsOn: DeployDev
+      environment: 'Dev'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: Approval@1
+              inputs:
+                instructions: 'Approve the deployment to production'
+                minimumApprovers: 1
+                timeoutInMinutes: 1440
+
+- stage: DeployStage
+  displayName: Deploy to Stage
+  dependsOn: [BuildVM, BuildWebApp]
+  condition: succeeded()
+  jobs:
+  - deployment: DeployStage
